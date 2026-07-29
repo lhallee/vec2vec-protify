@@ -1,13 +1,16 @@
-import torch
-import torch.nn.functional as F
 import os
 import sqlite3
+
 import numpy as np
+import torch
+import torch.nn.functional as F
+
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Optional, Dict, List, Any, Union
 from huggingface_hub import HfApi
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback, EvalPrediction, TrainerCallback
-from dataclasses import dataclass
+
 try:
     from probes.hybrid_probe import HybridProbe, HybridProbeConfig
     from probes.parallel_linear_probe import ParallelLinearProbe, ParallelLinearProbeConfig
@@ -476,13 +479,16 @@ Protify is an open source platform designed to simplify and democratize workflow
             validation_logits: np.ndarray,
             validation_labels: np.ndarray,
         ) -> float:
-        logits = np.asarray(validation_logits, dtype=np.float64)
-        labels = np.asarray(validation_labels)
+        # validation_logits: (n, c) or (n,); validation_labels: matching shape
+        logits = np.asarray(validation_logits, dtype=np.float64)  # (n, c) or (n,)
+        labels = np.asarray(validation_labels)  # (n, c) or (n,)
         if logits.ndim == 1:
-            logits = logits.reshape(-1, 1)
+            logits = logits.reshape(-1, 1)  # (n, 1)
         if labels.ndim == 1:
-            labels = labels.reshape(-1, 1)
-        probabilities = 1.0 / (1.0 + np.exp(-np.clip(logits, -88.0, 88.0)))
+            labels = labels.reshape(-1, 1)  # (n, 1)
+        probabilities = 1.0 / (  # (n, c)
+            1.0 + np.exp(-np.clip(logits, -88.0, 88.0))
+        )
         threshold = fit_thresholds(
             probabilities,
             labels,
@@ -531,11 +537,12 @@ Protify is an open source platform designed to simplify and democratize workflow
             validation_logits: np.ndarray,
             validation_labels: np.ndarray,
         ) -> List[float]:
+        # validation_logits: (n, r, c); validation_labels: (n, c) or (n, r, c)
         num_runs = validation_logits.shape[1]
         thresholds = []
         for run_idx in range(num_runs):
-            run_logits = validation_logits[:, run_idx, :]
-            run_labels = self._parallel_probe_labels_for_run(
+            run_logits = validation_logits[:, run_idx, :]  # (n, c)
+            run_labels = self._parallel_probe_labels_for_run(  # (n, c) or (n,)
                 validation_labels,
                 run_idx,
                 num_runs,
@@ -2037,12 +2044,6 @@ Protify is an open source platform designed to simplify and democratize workflow
                 DatasetClass = EmbedsLabelsDataset
                 CollatorClass = EmbedsLabelsCollator
 
-        """
-        For collator need to pass tokenizer, full, task_type
-        For dataset need to pass
-        hf_dataset, col_a, col_b, label_col, input_size, task_type, db_path, emb_dict, batch_size, read_scaler, full, train
-        """
-
         add_token_ids = getattr(self.probe_args, 'add_token_ids', False)
         padding = getattr(self.full_args, 'padding', 'max_length')
         max_length = getattr(self.full_args, 'max_length', 2048)
@@ -2073,13 +2074,8 @@ Protify is an open source platform designed to simplify and democratize workflow
         else:
             train_ds = DatasetClass(**deepcopy(common_kwargs))
         
-        # BUG FIX: Update hf_dataset in common_kwargs before creating validation and test datasets.
-        # Previously, common_kwargs['hf_dataset'] was set to train_dataset and never updated,
-        # causing valid_dataset and test_dataset to incorrectly use training data. This resulted
-        # in valid_metrics and test_metrics being identical since they were computed on the same
-        # (training) dataset. The fix ensures each dataset uses the correct HuggingFace dataset.
-        # We use deepcopy to ensure each dataset gets an independent copy of the kwargs dictionary
-        # to prevent any potential shared state issues.
+        # Build each evaluation wrapper from its own split and an independent
+        # argument mapping so no dataset can inherit the training source.
         common_kwargs['train'] = False
         common_kwargs['hf_dataset'] = valid_dataset
         if use_multi:

@@ -1,6 +1,10 @@
+import warnings
+
 import numpy as np
 import torch
-import warnings
+
+from typing import Any, Callable, Dict, List, Literal, Tuple, Union
+from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import (
     accuracy_score,
     auc,
@@ -17,8 +21,6 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from typing import Any, Callable, Dict, List, Literal, Tuple, Union
-from scipy.stats import pearsonr, spearmanr
 from transformers import EvalPrediction
 
 
@@ -202,13 +204,14 @@ def _coerce_multilabel_arrays(
     labels: Union[np.ndarray, torch.Tensor],
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Validate and convert multi-label probabilities and labels to CPU arrays."""
+    # probabilities: (n, c); labels: (n, c)
     if isinstance(probabilities, torch.Tensor):
-        probabilities = probabilities.detach().cpu().numpy()
+        probabilities = probabilities.detach().cpu().numpy()  # (n, c)
     if isinstance(labels, torch.Tensor):
-        labels = labels.detach().cpu().numpy()
+        labels = labels.detach().cpu().numpy()  # (n, c)
 
-    probs = np.asarray(probabilities, dtype=np.float64)
-    y_true = np.asarray(labels)
+    probs = np.asarray(probabilities, dtype=np.float64)  # (n, c)
+    y_true = np.asarray(labels)  # (n, c)
     if probs.ndim != 2:
         raise ValueError(
             "Multi-label probabilities must have shape (n_samples, n_labels); "
@@ -225,9 +228,9 @@ def _coerce_multilabel_arrays(
         raise ValueError("Multi-label targets must contain only 0 and 1.")
 
     # Preserve the legacy robustness policy while making the treatment explicit.
-    probs = np.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0)
-    probs = np.clip(probs, 0.0, 1.0)
-    return probs, y_true.astype(np.int64, copy=False)
+    probs = np.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0)  # (n, c)
+    probs = np.clip(probs, 0.0, 1.0)  # (n, c)
+    return probs, y_true.astype(np.int64, copy=False)  # each (n, c)
 
 
 def _fit_single_threshold(
@@ -238,19 +241,20 @@ def _fit_single_threshold(
     default_threshold: float,
 ) -> float:
     """Fit one F1-maximizing threshold with deterministic, conservative ties."""
+    # probabilities: (n,); labels: (n,)
     if np.unique(labels).size < 2:
         # A validation fold containing only one class cannot identify a useful
         # decision boundary. Keeping the declared default is stable and avoids
         # thresholds of zero for all-negative labels.
         return float(default_threshold)
 
-    candidates = np.arange(
+    candidates = np.arange(  # (t_grid,)
         0.0,
         1.0 + (increment * 0.5),
         increment,
         dtype=np.float64,
     )
-    candidates = np.unique(
+    candidates = np.unique(  # (t,)
         np.clip(
             np.concatenate(
                 (
@@ -263,14 +267,16 @@ def _fit_single_threshold(
             1.0,
         )
     )
-    scores = np.asarray(
+    scores = np.asarray(  # (t,)
         [
             f1_score(labels, probabilities >= cutoff, zero_division=0)
             for cutoff in candidates
         ],
         dtype=np.float64,
     )
-    best = candidates[np.isclose(scores, scores.max(), rtol=0.0, atol=1e-12)]
+    best = candidates[  # (t_best,)
+        np.isclose(scores, scores.max(), rtol=0.0, atol=1e-12)
+    ]
     # Prefer the least surprising cutoff when F1 is tied, then the higher
     # cutoff to avoid gratuitous false positives.
     return float(min(best.tolist(), key=lambda value: (abs(value - default_threshold), -value)))
@@ -311,26 +317,26 @@ def fit_thresholds(
     if not 0.0 <= default_threshold <= 1.0:
         raise ValueError("default_threshold must be in the interval [0, 1].")
 
-    probs, y_true = _coerce_multilabel_arrays(
+    probs, y_true = _coerce_multilabel_arrays(  # each (n, c)
         validation_probabilities, validation_labels
     )
     if mode == "global":
         return _fit_single_threshold(
-            probs.reshape(-1),
-            y_true.reshape(-1),
+            probs.reshape(-1),  # (n * c,)
+            y_true.reshape(-1),  # (n * c,)
             increment=increment,
             default_threshold=default_threshold,
         )
 
-    fitted = np.empty(probs.shape[1], dtype=np.float64)
+    fitted = np.empty(probs.shape[1], dtype=np.float64)  # (c,)
     for label_index in range(probs.shape[1]):
         fitted[label_index] = _fit_single_threshold(
-            probs[:, label_index],
-            y_true[:, label_index],
+            probs[:, label_index],  # (n,)
+            y_true[:, label_index],  # (n,)
             increment=increment,
             default_threshold=default_threshold,
         )
-    return fitted
+    return fitted  # (c,)
 
 
 def evaluate_at_threshold(
@@ -343,20 +349,20 @@ def evaluate_at_threshold(
     ``threshold`` may be a scalar global cutoff or a vector with one cutoff per
     label. No threshold is selected from ``labels`` in this function.
     """
-    probs, y_true = _coerce_multilabel_arrays(probabilities, labels)
-    threshold_array = np.asarray(threshold, dtype=np.float64)
+    probs, y_true = _coerce_multilabel_arrays(probabilities, labels)  # each (n, c)
+    threshold_array = np.asarray(threshold, dtype=np.float64)  # () or (c,)
     if threshold_array.ndim == 0:
         if not 0.0 <= float(threshold_array) <= 1.0:
             raise ValueError("threshold must be in the interval [0, 1].")
         applied_threshold = float(threshold_array)
-        threshold_payload: Union[float, list] = applied_threshold
+        threshold_payload: Union[float, List[float]] = applied_threshold
         threshold_mode = "global"
     elif threshold_array.ndim == 1 and threshold_array.shape[0] == probs.shape[1]:
         if not np.isfinite(threshold_array).all() or not (
             (threshold_array >= 0.0) & (threshold_array <= 1.0)
         ).all():
             raise ValueError("All per-label thresholds must be finite and in [0, 1].")
-        applied_threshold = threshold_array.reshape(1, -1)
+        applied_threshold = threshold_array.reshape(1, -1)  # (1, c)
         threshold_payload = threshold_array.tolist()
         threshold_mode = "per_label"
     else:
@@ -365,9 +371,9 @@ def evaluate_at_threshold(
             f"received {threshold_array.shape} for {probs.shape[1]} labels."
         )
 
-    y_pred = (probs >= applied_threshold).astype(np.int64, copy=False)
-    y_true_flat = y_true.reshape(-1)
-    y_pred_flat = y_pred.reshape(-1)
+    y_pred = (probs >= applied_threshold).astype(np.int64, copy=False)  # (n, c)
+    y_true_flat = y_true.reshape(-1)  # (n * c,)
+    y_pred_flat = y_pred.reshape(-1)  # (n * c,)
 
     mcc = (
         matthews_corrcoef(y_true_flat, y_pred_flat)

@@ -13,13 +13,14 @@ import json
 import math
 import struct
 import warnings
-from dataclasses import dataclass
-from functools import partial
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from dataclasses import dataclass
+from functools import partial
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 from einops import rearrange
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
@@ -1052,6 +1053,7 @@ class Vec2VecForEmbedding(nn.Module):
         output_hidden_states: Optional[bool] = False,
         **kwargs,
     ) -> torch.Tensor:
+        # input_ids: (b, l); attention_mask: (b, l) or None
         base_output = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1075,6 +1077,7 @@ class Vec2VecForEmbedding(nn.Module):
                 "Vec2Vec source encoder must produce residue embeddings with "
                 "shape (batch, sequence, hidden)"
             )
+        # base_state: (b, l, d_a)
         # Translator weights are loaded fp32; under autocast, base_state may be
         # bf16 which collides with the Linear weight dtype. Cast base output to
         # the translator's parameter dtype so autocast does not hand a bf16
@@ -1087,27 +1090,30 @@ class Vec2VecForEmbedding(nn.Module):
                 src=self.model_name_a,
                 tgt=self.model_name_b,
                 attention_mask=attention_mask,
-            )
+            )  # (b, d_b)
         else:
-            base_vec = self.pooler(base_state, attention_mask=attention_mask)
+            base_vec = self.pooler(  # (b, 2 * d_a)
+                base_state,
+                attention_mask=attention_mask,
+            )
             if self.config.input_standardize:
                 if base_vec.shape[1] != self._source_scaler_mean.numel():
                     raise ValueError(
                         "Pooled source width does not match the checkpoint "
                         "preprocessing scaler"
                     )
-                mean = self._source_scaler_mean.to(
+                mean = self._source_scaler_mean.to(  # (2 * d_a,)
                     device=base_vec.device,
                     dtype=base_vec.dtype,
                 )
-                scale = self._source_scaler_scale.to(
+                scale = self._source_scaler_scale.to(  # (2 * d_a,)
                     device=base_vec.device,
                     dtype=base_vec.dtype,
                 )
-                base_vec = (base_vec - mean) / scale
+                base_vec = (base_vec - mean) / scale  # (b, 2 * d_a)
             if self.input_l2_normalize:
                 epsilon = max(1e-12, torch.finfo(base_vec.dtype).tiny)
-                base_vec = F.normalize(
+                base_vec = F.normalize(  # (b, 2 * d_a)
                     base_vec,
                     p=2,
                     dim=1,
@@ -1117,8 +1123,8 @@ class Vec2VecForEmbedding(nn.Module):
                 base_vec.to(translator_dtype),
                 src=self.model_name_a,
                 tgt=self.model_name_b,
-            )
-        return translated
+            )  # (b, d_b)
+        return translated  # (b, d_b)
 
 
 def _source_encoder_spec(config: Vec2VecConfig) -> Tuple[str, Optional[str]]:
