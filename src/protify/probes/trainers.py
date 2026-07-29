@@ -63,7 +63,7 @@ try:
     )
     from visualization.ci_plots import regression_ci_plot, classification_ci_plot
     from utils import print_message
-    from metrics import get_compute_metrics, get_compute_metrics_with_balanced
+    from metrics import fit_thresholds, get_compute_metrics, get_compute_metrics_with_balanced
     from metrics_balanced import compute_balanced_regression_metrics
     from seed_utils import set_global_seed
     from probes.get_probe import get_probe
@@ -77,7 +77,7 @@ except ImportError:
     )
     from ..visualization.ci_plots import regression_ci_plot, classification_ci_plot
     from ..utils import print_message
-    from ..metrics import get_compute_metrics, get_compute_metrics_with_balanced
+    from ..metrics import fit_thresholds, get_compute_metrics, get_compute_metrics_with_balanced
     from ..metrics_balanced import compute_balanced_regression_metrics
     from ..seed_utils import set_global_seed
     from .get_probe import get_probe
@@ -378,6 +378,11 @@ class TrainerArguments:
 
 
 class TrainerMixin:
+    _MULTILABEL_THRESHOLD_MODE = "global"
+    _MULTILABEL_THRESHOLD_INCREMENT = 0.01
+    _MULTILABEL_THRESHOLD_METRIC = "micro_f1"
+    _MULTILABEL_THRESHOLD_VERSION = "validation_fitted_v1"
+
     def __init__(self, trainer_args: Optional[TrainerArguments] = None):
         self.trainer_args = trainer_args
 
@@ -465,6 +470,81 @@ Protify is an open source platform designed to simplify and democratize workflow
         if isinstance(label_ids, tuple):
             return label_ids[1]
         return label_ids
+
+    def _fit_multilabel_threshold_from_logits(
+            self,
+            validation_logits: np.ndarray,
+            validation_labels: np.ndarray,
+        ) -> float:
+        logits = np.asarray(validation_logits, dtype=np.float64)
+        labels = np.asarray(validation_labels)
+        if logits.ndim == 1:
+            logits = logits.reshape(-1, 1)
+        if labels.ndim == 1:
+            labels = labels.reshape(-1, 1)
+        probabilities = 1.0 / (1.0 + np.exp(-np.clip(logits, -88.0, 88.0)))
+        threshold = fit_thresholds(
+            probabilities,
+            labels,
+            mode=self._MULTILABEL_THRESHOLD_MODE,
+            increment=self._MULTILABEL_THRESHOLD_INCREMENT,
+            default_threshold=0.5,
+        )
+        assert np.ndim(threshold) == 0, (
+            "Trainer workflows currently require one global multi-label threshold per run."
+        )
+        return float(threshold)
+
+    def _multilabel_metrics_at_threshold(
+            self,
+            logits: np.ndarray,
+            labels: np.ndarray,
+            threshold: float,
+            split_name: str,
+            seed: Optional[int] = None,
+        ) -> Dict[str, Any]:
+        compute_metrics = get_compute_metrics('multilabel', tokenwise=False)
+        raw_metrics = compute_metrics(
+            EvalPrediction(predictions=np.asarray(logits), label_ids=np.asarray(labels)),
+            threshold=threshold,
+        )
+        prefixed = {
+            f"{split_name}_{key}": value
+            for key, value in raw_metrics.items()
+        }
+        provenance = {
+            f"{split_name}_threshold_fit_split": "validation",
+            f"{split_name}_threshold_fit_mode": self._MULTILABEL_THRESHOLD_MODE,
+            f"{split_name}_threshold_fit_metric": self._MULTILABEL_THRESHOLD_METRIC,
+            f"{split_name}_threshold_fit_method": "fixed_grid_search",
+            f"{split_name}_threshold_fit_increment": self._MULTILABEL_THRESHOLD_INCREMENT,
+            f"{split_name}_threshold_provenance_version": self._MULTILABEL_THRESHOLD_VERSION,
+            f"{split_name}_threshold_applied_without_refit": split_name != "eval",
+        }
+        if seed is not None:
+            provenance[f"{split_name}_threshold_fit_seed"] = int(seed)
+        prefixed.update(provenance)
+        return prefixed
+
+    def _parallel_probe_fit_multilabel_thresholds(
+            self,
+            validation_logits: np.ndarray,
+            validation_labels: np.ndarray,
+        ) -> List[float]:
+        num_runs = validation_logits.shape[1]
+        thresholds = []
+        for run_idx in range(num_runs):
+            run_logits = validation_logits[:, run_idx, :]
+            run_labels = self._parallel_probe_labels_for_run(
+                validation_labels,
+                run_idx,
+                num_runs,
+                run_logits.shape[-1],
+            )
+            thresholds.append(
+                self._fit_multilabel_threshold_from_logits(run_logits, run_labels)
+            )
+        return thresholds
 
     def _parallel_probe_labels_for_run(
             self,
@@ -618,15 +698,28 @@ Protify is an open source platform designed to simplify and democratize workflow
             logits: np.ndarray,
             labels: np.ndarray,
             split_name: str,
+            multilabel_threshold: Optional[float] = None,
+            threshold_fit_seed: Optional[int] = None,
         ) -> Dict[str, Any]:
         task_type = self.trainer_args.task_type
         ensemble_predictions = self._parallel_probe_ensemble_predictions(logits, task_type)
-        compute_metrics = get_compute_metrics(task_type, tokenwise=False)
-        raw_metrics = compute_metrics(EvalPrediction(predictions=ensemble_predictions, label_ids=labels))
-        prefixed_metrics = {
-            f"{split_name}_{key}": value
-            for key, value in raw_metrics.items()
-        }
+        if task_type == 'multilabel' and multilabel_threshold is not None:
+            prefixed_metrics = self._multilabel_metrics_at_threshold(
+                ensemble_predictions,
+                labels,
+                multilabel_threshold,
+                split_name,
+                seed=threshold_fit_seed,
+            )
+        else:
+            compute_metrics = get_compute_metrics(task_type, tokenwise=False)
+            raw_metrics = compute_metrics(
+                EvalPrediction(predictions=ensemble_predictions, label_ids=labels)
+            )
+            prefixed_metrics = {
+                f"{split_name}_{key}": value
+                for key, value in raw_metrics.items()
+            }
         prefixed_metrics[f"{split_name}_loss"] = self._parallel_probe_prediction_loss(
             ensemble_predictions,
             labels,
@@ -638,6 +731,7 @@ Protify is an open source platform designed to simplify and democratize workflow
             self,
             run_results,
             split_name: str,
+            multilabel_thresholds: Optional[List[float]] = None,
         ) -> Dict[str, Any]:
         predictions_by_run = []
         reference_labels = None
@@ -657,11 +751,34 @@ Protify is an open source platform designed to simplify and democratize workflow
         assert len(predictions_by_run) > 0, "Seed ensemble metrics require at least one run result."
         assert reference_labels is not None, "Seed ensemble metrics require labels."
         prediction_bank = np.stack(predictions_by_run, axis=1)
-        return self._parallel_probe_ensemble_metrics(
+        if self.trainer_args.task_type == 'multilabel':
+            assert multilabel_thresholds is not None, (
+                "Sequential multi-label ensemble metrics require validation-fitted "
+                "thresholds from every component run."
+            )
+            assert len(multilabel_thresholds) == len(predictions_by_run), (
+                "Sequential multi-label ensemble threshold count does not match run count."
+            )
+            ensemble_threshold = float(np.mean(multilabel_thresholds))
+        else:
+            ensemble_threshold = None
+        metrics = self._parallel_probe_ensemble_metrics(
             prediction_bank,
             reference_labels,
             split_name,
+            multilabel_threshold=ensemble_threshold,
         )
+        if ensemble_threshold is not None:
+            metrics[f"{split_name}_threshold_fit_method"] = (
+                "mean_of_validation_fitted_run_thresholds"
+            )
+            metrics[f"{split_name}_threshold_component_values"] = [
+                float(threshold) for threshold in multilabel_thresholds
+            ]
+            metrics[f"{split_name}_threshold_component_seeds"] = [
+                int(run_result[4]) for run_result in run_results
+            ]
+        return metrics
 
     def _parallel_probe_metrics_by_run(
             self,
@@ -669,20 +786,45 @@ Protify is an open source platform designed to simplify and democratize workflow
             labels: np.ndarray,
             data_name: str,
             split_name: str,
+            multilabel_thresholds: Optional[List[float]] = None,
+            run_seeds: Optional[List[int]] = None,
         ) -> List[Dict[str, Any]]:
         task_type = self.trainer_args.task_type
         compute_metrics = get_compute_metrics(task_type, tokenwise=False)
         losses = self._parallel_probe_losses_by_run(logits, labels, task_type)
         num_runs = logits.shape[1]
+        if multilabel_thresholds is not None:
+            assert task_type == 'multilabel', (
+                "Per-run classification thresholds are only valid for multi-label tasks."
+            )
+            assert len(multilabel_thresholds) == num_runs, (
+                f"Expected {num_runs} multi-label thresholds, got {len(multilabel_thresholds)}."
+            )
+        if run_seeds is not None:
+            assert len(run_seeds) == num_runs, (
+                f"Expected {num_runs} run seeds, got {len(run_seeds)}."
+            )
         metrics_by_run = []
         for run_idx in range(num_runs):
             run_logits = logits[:, run_idx, :]
             run_labels = self._parallel_probe_labels_for_run(labels, run_idx, num_runs, run_logits.shape[-1])
-            raw_metrics = compute_metrics(EvalPrediction(predictions=run_logits, label_ids=run_labels))
-            prefixed_metrics = {
-                f"{split_name}_{key}": value
-                for key, value in raw_metrics.items()
-            }
+            if task_type == 'multilabel' and multilabel_thresholds is not None:
+                fit_seed = None if run_seeds is None else run_seeds[run_idx]
+                prefixed_metrics = self._multilabel_metrics_at_threshold(
+                    run_logits,
+                    run_labels,
+                    multilabel_thresholds[run_idx],
+                    split_name,
+                    seed=fit_seed,
+                )
+            else:
+                raw_metrics = compute_metrics(
+                    EvalPrediction(predictions=run_logits, label_ids=run_labels)
+                )
+                prefixed_metrics = {
+                    f"{split_name}_{key}": value
+                    for key, value in raw_metrics.items()
+                }
             prefixed_metrics[f"{split_name}_loss"] = losses[run_idx]
 
             bw_store = self.balanced_weights if 'balanced_weights' in self.__dict__ else None
@@ -1099,6 +1241,7 @@ Protify is an open source platform designed to simplify and democratize workflow
             parallel_run_records = []
             valid_logits_by_run = [None] * self.trainer_args.num_runs
             test_logits_by_run = [None] * self.trainer_args.num_runs
+            multilabel_thresholds_by_run = [None] * self.trainer_args.num_runs
             valid_labels_for_ensemble = None
             test_labels_for_ensemble = None
 
@@ -1185,17 +1328,31 @@ Protify is an open source platform designed to simplify and democratize workflow
                         "Parallel probe test labels changed between seed groups."
                     )
 
+                if task_type == 'multilabel':
+                    group_multilabel_thresholds = (
+                        self._parallel_probe_fit_multilabel_thresholds(
+                            valid_logits,
+                            valid_labels,
+                        )
+                    )
+                else:
+                    group_multilabel_thresholds = None
+
                 group_valid_metrics = self._parallel_probe_metrics_by_run(
                     valid_logits,
                     valid_labels,
                     data_name,
                     'eval',
+                    multilabel_thresholds=group_multilabel_thresholds,
+                    run_seeds=run_seeds,
                 )
                 group_test_metrics = self._parallel_probe_metrics_by_run(
                     test_logits,
                     test_labels,
                     data_name,
                     'test',
+                    multilabel_thresholds=group_multilabel_thresholds,
+                    run_seeds=run_seeds,
                 )
                 all_valid_metrics.extend(group_valid_metrics)
                 all_test_metrics.extend(group_test_metrics)
@@ -1215,6 +1372,10 @@ Protify is an open source platform designed to simplify and democratize workflow
                     )
                     valid_logits_by_run[global_run_idx] = valid_logits[:, local_run_idx, :].astype(np.float32)
                     test_logits_by_run[global_run_idx] = test_logits[:, local_run_idx, :].astype(np.float32)
+                    if group_multilabel_thresholds is not None:
+                        multilabel_thresholds_by_run[global_run_idx] = float(
+                            group_multilabel_thresholds[local_run_idx]
+                        )
                     parallel_run_records.append(
                         {
                             'run_index': global_run_idx,
@@ -1227,6 +1388,14 @@ Protify is an open source platform designed to simplify and democratize workflow
                             'local_run_number': local_run_idx + 1,
                             'valid_loss': valid_loss,
                             'test_loss': test_loss,
+                            'classification_threshold': (
+                                None
+                                if group_multilabel_thresholds is None
+                                else float(group_multilabel_thresholds[local_run_idx])
+                            ),
+                            'threshold_fit_split': (
+                                None if group_multilabel_thresholds is None else 'validation'
+                            ),
                         }
                     )
                     if test_loss < best_loss:
@@ -1235,6 +1404,19 @@ Protify is an open source platform designed to simplify and democratize workflow
                         best_run_id = run_spec.run_id
                         best_seed = run_spec.seed
                         best_model = parallel_model.to_linear_probe(local_run_idx)
+                        if group_multilabel_thresholds is not None:
+                            best_model.config.multilabel_threshold = float(
+                                group_multilabel_thresholds[local_run_idx]
+                            )
+                            best_model.config.multilabel_threshold_provenance = {
+                                'fit_split': 'validation',
+                                'fit_mode': self._MULTILABEL_THRESHOLD_MODE,
+                                'fit_metric': self._MULTILABEL_THRESHOLD_METRIC,
+                                'fit_method': 'fixed_grid_search',
+                                'fit_increment': self._MULTILABEL_THRESHOLD_INCREMENT,
+                                'fit_seed': int(run_spec.seed),
+                                'version': self._MULTILABEL_THRESHOLD_VERSION,
+                            }
                         best_y_pred = test_logits[:, local_run_idx, :].astype(np.float32)
                         best_y_true = test_labels.astype(np.float32)
 
@@ -1252,17 +1434,36 @@ Protify is an open source platform designed to simplify and democratize workflow
             assert all(logits is not None for logits in test_logits_by_run), (
                 "Parallel probe training did not produce test logits for every run."
             )
+            if task_type == 'multilabel':
+                assert all(threshold is not None for threshold in multilabel_thresholds_by_run), (
+                    "Parallel probe training did not fit a validation threshold for every run."
+                )
             valid_bank_logits = np.stack(valid_logits_by_run, axis=1)
             test_bank_logits = np.stack(test_logits_by_run, axis=1)
+            if task_type == 'multilabel':
+                ensemble_valid_logits = self._parallel_probe_ensemble_predictions(
+                    valid_bank_logits,
+                    task_type,
+                )
+                ensemble_multilabel_threshold = (
+                    self._fit_multilabel_threshold_from_logits(
+                        ensemble_valid_logits,
+                        valid_labels_for_ensemble,
+                    )
+                )
+            else:
+                ensemble_multilabel_threshold = None
             ensemble_valid_metrics = self._parallel_probe_ensemble_metrics(
                 valid_bank_logits,
                 valid_labels_for_ensemble,
                 'eval',
+                multilabel_threshold=ensemble_multilabel_threshold,
             )
             ensemble_test_metrics = self._parallel_probe_ensemble_metrics(
                 test_bank_logits,
                 test_labels_for_ensemble,
                 'test',
+                multilabel_threshold=ensemble_multilabel_threshold,
             )
             aggregated_valid = self._aggregate_metrics(all_valid_metrics)
             aggregated_test = self._aggregate_metrics(all_test_metrics)
@@ -1353,6 +1554,29 @@ Protify is an open source platform designed to simplify and democratize workflow
             aggregated_test['parallel_probe_invocation_reduction'] = parallel_plan.invocation_reduction
             aggregated_test['parallel_probe_compression_ratio'] = parallel_plan.compression_ratio
             aggregated_test['parallel_probe_run_seeds'] = all_run_seeds
+            if task_type == 'multilabel':
+                aggregated_test['parallel_probe_multilabel_thresholds'] = [
+                    float(threshold) for threshold in multilabel_thresholds_by_run
+                ]
+                aggregated_test['parallel_probe_threshold_fit_split'] = 'validation'
+                aggregated_test['parallel_probe_threshold_fit_mode'] = (
+                    self._MULTILABEL_THRESHOLD_MODE
+                )
+                aggregated_test['parallel_probe_threshold_fit_metric'] = (
+                    self._MULTILABEL_THRESHOLD_METRIC
+                )
+                aggregated_test['parallel_probe_threshold_fit_increment'] = (
+                    self._MULTILABEL_THRESHOLD_INCREMENT
+                )
+                aggregated_test['parallel_probe_threshold_provenance_version'] = (
+                    self._MULTILABEL_THRESHOLD_VERSION
+                )
+                aggregated_test['parallel_probe_ensemble_multilabel_threshold'] = float(
+                    ensemble_multilabel_threshold
+                )
+                aggregated_test['parallel_probe_ensemble_threshold_component_seeds'] = (
+                    all_run_seeds
+                )
             aggregated_test['parallel_probe_run_records'] = self._parallel_probe_json_safe(parallel_run_records)
             aggregated_test['parallel_probe_valid_run_metrics'] = self._parallel_probe_json_safe(all_valid_metrics)
             aggregated_test['parallel_probe_test_run_metrics'] = self._parallel_probe_json_safe(all_test_metrics)
@@ -1411,6 +1635,11 @@ Protify is an open source platform designed to simplify and democratize workflow
         ):
         task_type = self.trainer_args.task_type
         tokenwise = self.probe_args.tokenwise
+        if task_type == 'multilabel' and valid_dataset is None:
+            raise ValueError(
+                "Multi-label evaluation requires a validation split to fit the "
+                "classification threshold without test-label leakage."
+            )
         compute_metrics = get_compute_metrics(task_type, tokenwise=tokenwise)
         self.trainer_args.train_data_size = len(train_dataset)
         self.trainer_args.num_labels = self.probe_args.num_labels
@@ -1431,8 +1660,9 @@ Protify is an open source platform designed to simplify and democratize workflow
             callbacks=[EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)]
         )
         trainer.can_return_loss = True
-        metrics = trainer.evaluate(test_dataset)
-        print_message(f'Initial metrics: {metrics}')
+        initial_eval_dataset = valid_dataset if valid_dataset is not None else test_dataset
+        metrics = trainer.evaluate(initial_eval_dataset)
+        print_message(f'Initial validation metrics: {metrics}')
 
         bw_store = self.balanced_weights if 'balanced_weights' in self.__dict__ else None
         bw = bw_store[data_name] if (bw_store is not None and data_name in bw_store) else None
@@ -1463,6 +1693,10 @@ Protify is an open source platform designed to simplify and democratize workflow
             y_true_valid = y_true_valid[0]
         y_pred_valid = y_pred_valid.astype(np.float32)
         y_true_valid = y_true_valid.astype(np.float32)
+        if y_pred_valid.ndim == 3 and y_pred_valid.shape[1] == 1:
+            y_pred_valid = y_pred_valid.squeeze(1)
+        if y_true_valid.ndim == 3 and y_true_valid.shape[1] == 1:
+            y_true_valid = y_true_valid.squeeze(1)
 
         if balanced_active:
             trainer.compute_metrics = compute_metrics
@@ -1479,6 +1713,41 @@ Protify is an open source platform designed to simplify and democratize workflow
             y_pred = y_pred.squeeze(1)
         if y_true.ndim == 3 and y_true.shape[1] == 1:
             y_true = y_true.squeeze(1)
+
+        if task_type == 'multilabel':
+            multilabel_threshold = self._fit_multilabel_threshold_from_logits(
+                y_pred_valid,
+                y_true_valid,
+            )
+            valid_metrics.update(
+                self._multilabel_metrics_at_threshold(
+                    y_pred_valid,
+                    y_true_valid,
+                    multilabel_threshold,
+                    'eval',
+                    seed=self.trainer_args.seed,
+                )
+            )
+            test_metrics.update(
+                self._multilabel_metrics_at_threshold(
+                    y_pred,
+                    y_true,
+                    multilabel_threshold,
+                    'test',
+                    seed=self.trainer_args.seed,
+                )
+            )
+            if hasattr(trainer.model, 'config'):
+                trainer.model.config.multilabel_threshold = float(multilabel_threshold)
+                trainer.model.config.multilabel_threshold_provenance = {
+                    'fit_split': 'validation',
+                    'fit_mode': self._MULTILABEL_THRESHOLD_MODE,
+                    'fit_metric': self._MULTILABEL_THRESHOLD_METRIC,
+                    'fit_method': 'fixed_grid_search',
+                    'fit_increment': self._MULTILABEL_THRESHOLD_INCREMENT,
+                    'fit_seed': int(self.trainer_args.seed),
+                    'version': self._MULTILABEL_THRESHOLD_VERSION,
+                }
 
         if task_type in ('regression', 'sigmoid_regression') and self.trainer_args.balanced_regression_metrics:
             bw_store = self.balanced_weights if 'balanced_weights' in self.__dict__ else None
@@ -1918,7 +2187,17 @@ Protify is an open source platform designed to simplify and democratize workflow
         # Compute aggregated metrics (mean ± std)
         aggregated_valid = self._aggregate_metrics(all_valid_metrics)
         aggregated_test = self._aggregate_metrics(all_test_metrics)
-        ensemble_test_metrics = self._seed_ensemble_metrics_from_run_results(run_results, 'test')
+        if task_type == 'multilabel':
+            run_multilabel_thresholds = [
+                float(metrics['test_threshold']) for metrics in all_test_metrics
+            ]
+        else:
+            run_multilabel_thresholds = None
+        ensemble_test_metrics = self._seed_ensemble_metrics_from_run_results(
+            run_results,
+            'test',
+            multilabel_thresholds=run_multilabel_thresholds,
+        )
         for key, value in ensemble_test_metrics.items():
             aggregated_test[f"sequential_probe_ensemble_{key}"] = value
         aggregated_test['sequential_probe_ensemble_average_mode'] = (
@@ -1932,9 +2211,34 @@ Protify is an open source platform designed to simplify and democratize workflow
                 'run_number': result[0] + 1,
                 'seed': result[4],
                 'test_loss': result[1],
+                'classification_threshold': (
+                    None
+                    if run_multilabel_thresholds is None
+                    else run_multilabel_thresholds[result[0]]
+                ),
+                'threshold_fit_split': (
+                    None if run_multilabel_thresholds is None else 'validation'
+                ),
             }
             for result in run_results
         ]
+        if run_multilabel_thresholds is not None:
+            aggregated_test['sequential_probe_multilabel_thresholds'] = (
+                run_multilabel_thresholds
+            )
+            aggregated_test['sequential_probe_threshold_fit_split'] = 'validation'
+            aggregated_test['sequential_probe_threshold_fit_mode'] = (
+                self._MULTILABEL_THRESHOLD_MODE
+            )
+            aggregated_test['sequential_probe_threshold_fit_metric'] = (
+                self._MULTILABEL_THRESHOLD_METRIC
+            )
+            aggregated_test['sequential_probe_threshold_fit_increment'] = (
+                self._MULTILABEL_THRESHOLD_INCREMENT
+            )
+            aggregated_test['sequential_probe_threshold_provenance_version'] = (
+                self._MULTILABEL_THRESHOLD_VERSION
+            )
         
         # Find the best run (lowest test loss)
         best_run = min(run_results, key=lambda x: x[1])

@@ -40,7 +40,15 @@ class BaseModelArguments:
 
 
 def get_base_model(model_name: str, masked_lm: bool = False, dtype=None, model_path: str = None):
-    if 'random' in model_name.lower():
+    if model_name.lower() == 'cached':
+        raise RuntimeError(
+            "The cached model type is cache-only and cannot instantiate an encoder. "
+            "Populate the complete pooled-embedding cache before training."
+        )
+    if 'vec2vec' in model_name.lower():
+        from .vec2vec import build_vec2vec_model
+        return build_vec2vec_model(model_name, masked_lm=masked_lm, dtype=dtype, model_path=model_path)
+    elif 'random' in model_name.lower():
         from .random import build_random_model
         return build_random_model(model_name, masked_lm=masked_lm, dtype=dtype, model_path=model_path)
     elif 'esm2' in model_name.lower() and model_name.lower().count('esm2') == 1:
@@ -135,6 +143,14 @@ def get_base_model_for_training(model_name: str, tokenwise: bool = False, num_la
 
 
 def get_tokenizer(model_name: str, model_path: str = None):
+    if model_name.lower() == 'cached':
+        # Pooled-embedding collators do not consume a tokenizer. Returning None
+        # keeps cache-only experiments independent of encoder packages and
+        # prevents accidental network/model loading in the probe hot path.
+        return None
+    if 'vec2vec' in model_name.lower():
+        from .vec2vec import get_vec2vec_tokenizer
+        return get_vec2vec_tokenizer(model_name, model_path=model_path)
     if 'custom' in model_name.lower():
         from .custom_model import build_custom_tokenizer
         assert model_path is not None, "model_path is required for custom models. Use --model_paths and --model_types custom."

@@ -1,8 +1,6 @@
 import numpy as np
 import torch
-from typing import Any, Callable, Dict, List, Tuple
-
-from scipy.stats import pearsonr, spearmanr
+import warnings
 from sklearn.metrics import (
     accuracy_score,
     auc,
@@ -19,6 +17,8 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+from typing import Any, Callable, Dict, List, Literal, Tuple, Union
+from scipy.stats import pearsonr, spearmanr
 from transformers import EvalPrediction
 
 
@@ -192,6 +192,210 @@ def max_metrics(
     max_index = torch.argmax(valid_f1s)  # ()
 
     return f1s[max_index].item(), precision[max_index].item(), recall[max_index].item(), cutoffs[max_index].item()
+
+
+Thresholds = Union[float, np.ndarray]
+
+
+def _coerce_multilabel_arrays(
+    probabilities: Union[np.ndarray, torch.Tensor],
+    labels: Union[np.ndarray, torch.Tensor],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Validate and convert multi-label probabilities and labels to CPU arrays."""
+    if isinstance(probabilities, torch.Tensor):
+        probabilities = probabilities.detach().cpu().numpy()
+    if isinstance(labels, torch.Tensor):
+        labels = labels.detach().cpu().numpy()
+
+    probs = np.asarray(probabilities, dtype=np.float64)
+    y_true = np.asarray(labels)
+    if probs.ndim != 2:
+        raise ValueError(
+            "Multi-label probabilities must have shape (n_samples, n_labels); "
+            f"received {probs.shape}."
+        )
+    if probs.shape != y_true.shape:
+        raise ValueError(
+            "Probability and label shapes must match; "
+            f"received {probs.shape} and {y_true.shape}."
+        )
+    if probs.size == 0:
+        raise ValueError("Cannot fit or evaluate thresholds on an empty array.")
+    if not np.isin(y_true, (0, 1)).all():
+        raise ValueError("Multi-label targets must contain only 0 and 1.")
+
+    # Preserve the legacy robustness policy while making the treatment explicit.
+    probs = np.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0)
+    probs = np.clip(probs, 0.0, 1.0)
+    return probs, y_true.astype(np.int64, copy=False)
+
+
+def _fit_single_threshold(
+    probabilities: np.ndarray,
+    labels: np.ndarray,
+    *,
+    increment: float,
+    default_threshold: float,
+) -> float:
+    """Fit one F1-maximizing threshold with deterministic, conservative ties."""
+    if np.unique(labels).size < 2:
+        # A validation fold containing only one class cannot identify a useful
+        # decision boundary. Keeping the declared default is stable and avoids
+        # thresholds of zero for all-negative labels.
+        return float(default_threshold)
+
+    candidates = np.arange(
+        0.0,
+        1.0 + (increment * 0.5),
+        increment,
+        dtype=np.float64,
+    )
+    candidates = np.unique(
+        np.clip(
+            np.concatenate(
+                (
+                    candidates,
+                    probabilities,
+                    [default_threshold, 1.0],
+                )
+            ),
+            0.0,
+            1.0,
+        )
+    )
+    scores = np.asarray(
+        [
+            f1_score(labels, probabilities >= cutoff, zero_division=0)
+            for cutoff in candidates
+        ],
+        dtype=np.float64,
+    )
+    best = candidates[np.isclose(scores, scores.max(), rtol=0.0, atol=1e-12)]
+    # Prefer the least surprising cutoff when F1 is tied, then the higher
+    # cutoff to avoid gratuitous false positives.
+    return float(min(best.tolist(), key=lambda value: (abs(value - default_threshold), -value)))
+
+
+def fit_thresholds(
+    validation_probabilities: Union[np.ndarray, torch.Tensor],
+    validation_labels: Union[np.ndarray, torch.Tensor],
+    *,
+    mode: Literal["global", "per_label"] = "global",
+    increment: float = 0.01,
+    default_threshold: float = 0.5,
+) -> Thresholds:
+    """Fit decision thresholds on validation data for later held-out evaluation.
+
+    Parameters
+    ----------
+    validation_probabilities:
+        Sigmoid probabilities with shape ``(n_samples, n_labels)``.
+    validation_labels:
+        Binary validation targets with the same shape.
+    mode:
+        ``"global"`` fits one micro-F1 threshold over all labels.
+        ``"per_label"`` fits each label separately.
+    increment:
+        Threshold grid spacing in ``(0, 1]``.
+    default_threshold:
+        Fallback for labels whose validation fold contains only one class.
+
+    This function deliberately has no test-set concept. Persist its return value
+    with the validation checkpoint and pass it unchanged to
+    :func:`evaluate_at_threshold` for held-out evaluation.
+    """
+    if mode not in {"global", "per_label"}:
+        raise ValueError("mode must be either 'global' or 'per_label'.")
+    if not 0.0 < increment <= 1.0:
+        raise ValueError("increment must be in the interval (0, 1].")
+    if not 0.0 <= default_threshold <= 1.0:
+        raise ValueError("default_threshold must be in the interval [0, 1].")
+
+    probs, y_true = _coerce_multilabel_arrays(
+        validation_probabilities, validation_labels
+    )
+    if mode == "global":
+        return _fit_single_threshold(
+            probs.reshape(-1),
+            y_true.reshape(-1),
+            increment=increment,
+            default_threshold=default_threshold,
+        )
+
+    fitted = np.empty(probs.shape[1], dtype=np.float64)
+    for label_index in range(probs.shape[1]):
+        fitted[label_index] = _fit_single_threshold(
+            probs[:, label_index],
+            y_true[:, label_index],
+            increment=increment,
+            default_threshold=default_threshold,
+        )
+    return fitted
+
+
+def evaluate_at_threshold(
+    probabilities: Union[np.ndarray, torch.Tensor],
+    labels: Union[np.ndarray, torch.Tensor],
+    threshold: Thresholds = 0.5,
+) -> Dict[str, Any]:
+    """Evaluate multi-label probabilities at a pre-declared threshold.
+
+    ``threshold`` may be a scalar global cutoff or a vector with one cutoff per
+    label. No threshold is selected from ``labels`` in this function.
+    """
+    probs, y_true = _coerce_multilabel_arrays(probabilities, labels)
+    threshold_array = np.asarray(threshold, dtype=np.float64)
+    if threshold_array.ndim == 0:
+        if not 0.0 <= float(threshold_array) <= 1.0:
+            raise ValueError("threshold must be in the interval [0, 1].")
+        applied_threshold = float(threshold_array)
+        threshold_payload: Union[float, list] = applied_threshold
+        threshold_mode = "global"
+    elif threshold_array.ndim == 1 and threshold_array.shape[0] == probs.shape[1]:
+        if not np.isfinite(threshold_array).all() or not (
+            (threshold_array >= 0.0) & (threshold_array <= 1.0)
+        ).all():
+            raise ValueError("All per-label thresholds must be finite and in [0, 1].")
+        applied_threshold = threshold_array.reshape(1, -1)
+        threshold_payload = threshold_array.tolist()
+        threshold_mode = "per_label"
+    else:
+        raise ValueError(
+            "threshold must be a scalar or have shape (n_labels,); "
+            f"received {threshold_array.shape} for {probs.shape[1]} labels."
+        )
+
+    y_pred = (probs >= applied_threshold).astype(np.int64, copy=False)
+    y_true_flat = y_true.reshape(-1)
+    y_pred_flat = y_pred.reshape(-1)
+
+    mcc = (
+        matthews_corrcoef(y_true_flat, y_pred_flat)
+        if np.unique(y_true_flat).size > 1 and np.unique(y_pred_flat).size > 1
+        else 0.0
+    )
+    return {
+        "accuracy": round(float(accuracy_score(y_true_flat, y_pred_flat)), 5),
+        "f1": round(
+            float(f1_score(y_true_flat, y_pred_flat, zero_division=0)), 5
+        ),
+        "precision": round(
+            float(precision_score(y_true_flat, y_pred_flat, zero_division=0)), 5
+        ),
+        "recall": round(
+            float(recall_score(y_true_flat, y_pred_flat, zero_division=0)), 5
+        ),
+        "hamming_loss": round(float(hamming_loss(y_true_flat, y_pred_flat)), 5),
+        "threshold": threshold_payload,
+        "threshold_mode": threshold_mode,
+        "mcc": round(float(mcc), 5),
+        "roc_auc": round(
+            calculate_robust_roc_auc_multilabel(y_true, probs), 5
+        ),
+        "pr_auc": round(
+            calculate_robust_pr_auc_multilabel(y_true, probs), 5
+        ),
+    }
 
 
 
@@ -429,72 +633,99 @@ def compute_tokenwise_classification_metrics(p: EvalPrediction) -> Dict[str, flo
     }
 
 
-def compute_multi_label_classification_metrics(p: EvalPrediction) -> Dict[str, float]:
+def compute_multi_label_classification_metrics(
+    p: EvalPrediction,
+    threshold: float = 0.5,
+    *,
+    legacy_optimize_on_eval: bool = False,
+) -> Dict[str, float]:
     """
     Compute comprehensive metrics for multi-label classification tasks.
 
     Args:
         p: EvalPrediction object containing model predictions and ground truth labels
+        threshold:
+            A pre-declared global threshold, normally fitted on validation data
+            with :func:`fit_thresholds`. Defaults to 0.5.
+        legacy_optimize_on_eval:
+            Reproduce the historical behavior that optimized F1 directly on
+            the evaluated labels. This leaks held-out labels and is retained
+            only for explicit legacy comparisons.
 
     Returns:
         Dictionary containing the following metrics (all rounded to 5 decimal places):
             - accuracy: Overall accuracy
-            - f1: F1 score (optimized across thresholds)
-            - precision: Precision score (at optimal threshold)
-            - recall: Recall score (at optimal threshold)
+            - f1: F1 score at the pre-declared threshold
+            - precision: Precision score at the pre-declared threshold
+            - recall: Recall score at the pre-declared threshold
             - hamming_loss: Proportion of wrong labels
-            - threshold: Optimal classification threshold
+            - threshold: Applied classification threshold
             - mcc: Matthews Correlation Coefficient
             - roc_auc: Area Under ROC Curve (macro average)
             - pr_auc: Area Under Precision-Recall Curve (macro average)
 
     Note:
-        - Converts inputs to PyTorch tensors
-        - Applies softmax to raw predictions
-        - Uses threshold optimization for best F1 score
-        - Handles multi-class ROC AUC using one-vs-rest
-        - All metrics are computed on flattened predictions
+        - Applies sigmoid to raw logits
+        - Does not select a threshold from evaluated labels by default
+        - All threshold-dependent metrics use the same cutoff
+        - ``legacy_optimize_on_eval=True`` is intentionally explicit and warns
     """
     preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
     labels = p.label_ids[1] if isinstance(p.label_ids, tuple) else p.label_ids
     # preds: (n, c); labels: (n, c)
 
-    if not isinstance(preds, torch.Tensor):
-        preds = torch.tensor(preds)  # (n, c)
-    if not isinstance(labels, torch.Tensor):
-        y_true = torch.tensor(labels, dtype=torch.int)  # (n, c)
+    logits = (
+        preds.detach().float().cpu()
+        if isinstance(preds, torch.Tensor)
+        else torch.as_tensor(preds, dtype=torch.float32)
+    )
+    y_true = (
+        labels.detach().cpu().numpy()
+        if isinstance(labels, torch.Tensor)
+        else np.asarray(labels)
+    )
+    probs = torch.sigmoid(logits).numpy()
+
+    if legacy_optimize_on_eval:
+        warnings.warn(
+            "Optimizing a multi-label threshold on the evaluated labels leaks "
+            "held-out outcomes. Fit thresholds on validation data with "
+            "fit_thresholds() and pass the result to evaluate_at_threshold().",
+            FutureWarning,
+            stacklevel=2,
+        )
+        # Preserve the historical outputs exactly: F1/precision/recall use the
+        # evaluation-optimized threshold, while accuracy/Hamming/MCC use 0.5.
+        metrics = evaluate_at_threshold(probs, y_true, threshold=0.5)
+        f1, precision, recall, fitted_threshold = max_metrics(
+            torch.as_tensor(probs).flatten(),
+            torch.as_tensor(y_true, dtype=torch.int64).flatten(),
+        )
+        metrics.update(
+            {
+                "f1": round(f1, 5),
+                "precision": round(precision, 5),
+                "recall": round(recall, 5),
+                "threshold": round(fitted_threshold, 5),
+            }
+        )
     else:
-        y_true = labels.int()  # (n, c)
+        metrics = evaluate_at_threshold(probs, y_true, threshold=threshold)
 
-    probs = preds.sigmoid()  # (n, c)
-    y_pred = (probs > 0.5).int()  # (n, c)
-
-    probs_flat = probs.flatten()  # (n * c,)
-    y_true_flat = y_true.flatten()  # (n * c,)
-    f1, prec, recall, thres = max_metrics(probs_flat, y_true_flat)
-
-    y_pred_flat = y_pred.flatten().numpy()  # (n * c,)
-    y_true_flat = y_true.flatten().numpy()  # (n * c,)
-
-    accuracy = accuracy_score(y_pred_flat, y_true_flat)
-    hamming = hamming_loss(y_pred_flat, y_true_flat)
-    mcc = matthews_corrcoef(y_true_flat, y_pred_flat)
-
-    y_true_array = y_true.numpy()  # (n, c)
-    probabilities_array = probs.numpy()  # (n, c)
-    roc_auc = calculate_robust_roc_auc_multilabel(y_true_array, probabilities_array)
-    pr_auc = calculate_robust_pr_auc_multilabel(y_true_array, probabilities_array)
-
+    # Keep the Trainer-facing schema backward compatible and entirely numeric.
     return {
-        'accuracy': round(accuracy, 5),
-        'f1': round(f1, 5),
-        'precision': round(prec, 5),
-        'recall': round(recall, 5),
-        'hamming_loss': round(hamming, 5),
-        'threshold': round(thres, 5),
-        'mcc': round(mcc, 5),
-        'roc_auc': round(roc_auc, 5),
-        'pr_auc': round(pr_auc, 5)
+        key: metrics[key]
+        for key in (
+            "accuracy",
+            "f1",
+            "precision",
+            "recall",
+            "hamming_loss",
+            "threshold",
+            "mcc",
+            "roc_auc",
+            "pr_auc",
+        )
     }
 
 

@@ -67,6 +67,7 @@ def parse_arguments():
     parser.add_argument("--trim", action="store_true",
                         help="Truncate sequences longer than --max_length instead of dropping them from the dataset.")
     parser.add_argument("--data_names", nargs="+", default=[], help="List of HF dataset names.")
+    parser.add_argument("--data_revisions", nargs="+", default=None, help="Optional immutable Hugging Face revisions aligned one-for-one with --data_names.")
     parser.add_argument("--data_dirs", nargs="+", default=[], help="List of local data directories.")
     parser.add_argument("--aa_to_dna", action="store_true", help="Translate amino-acid sequences to DNA codon sequences using common human synonymous codons.")
     parser.add_argument("--aa_to_rna", action="store_true", help="Translate amino-acid sequences to RNA codon sequences using common human synonymous codons.")
@@ -79,7 +80,7 @@ def parse_arguments():
     # ----------------- BaseModelArguments ----------------- #
     parser.add_argument("--model_names", nargs="+", default=None, help="List of preset model names to use (e.g. ESM2-8). Mutually exclusive with --model_paths/--model_types.")
     parser.add_argument("--model_paths", nargs="+", default=None, help="List of model paths (HuggingFace or local). Must be paired with --model_types. Mutually exclusive with --model_names.")
-    parser.add_argument("--model_types", nargs="+", default=None, help="List of model type keywords paired with --model_paths (e.g. esm2, esmc, protbert, prott5, ankh, glm, dplm, dplm2, protclm, onehot, amplify, e1, calm, custom, random).")
+    parser.add_argument("--model_types", nargs="+", default=None, help="List of model type keywords paired with --model_paths (e.g. esm2, esmc, protbert, prott5, ankh, glm, dplm, dplm2, protclm, onehot, amplify, e1, vec2vec, calm, custom, random, cached). The cached type requires a complete precomputed pooled-embedding file and never instantiates an encoder.")
     parser.add_argument("--model_dtype", type=str, choices=["fp32", "fp16", "bf16", "float32", "float16", "bfloat16"], default="bf16", help="Data type for loading base models.")
     parser.add_argument("--use_xformers", action="store_true", help="Use xformers memory-efficient attention for AMPLIFY models.")
 
@@ -390,6 +391,8 @@ def parse_arguments():
         if (args.sweep_goal != "minimize") or ("sweep_goal" not in yaml_args.__dict__):
             yaml_args.sweep_goal = args.sweep_goal
         yaml_args.yaml_path = args.yaml_path
+        if (args.data_revisions is not None) or ("data_revisions" not in yaml_args.__dict__):
+            yaml_args.data_revisions = args.data_revisions
         yaml_args.aa_to_dna = _merge_store_true(args.aa_to_dna, "aa_to_dna")
         yaml_args.aa_to_rna = _merge_store_true(args.aa_to_rna, "aa_to_rna")
         yaml_args.dna_to_aa = _merge_store_true(args.dna_to_aa, "dna_to_aa")

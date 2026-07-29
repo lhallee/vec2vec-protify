@@ -69,6 +69,7 @@ class DataArguments:
     def __init__(
             self,
             data_names: List[str],
+            data_revisions: Optional[List[str]] = None,
             delimiter: str = ',',
             col_names: List[str] = ['seqs', 'labels'],
             max_length: int = 1024,
@@ -84,6 +85,11 @@ class DataArguments:
             **kwargs
         ):
         self.data_names = data_names
+        if data_revisions is not None:
+            assert len(data_revisions) == len(data_names), (
+                "data_revisions must align one-for-one with data_names"
+            )
+        self.data_revisions = data_revisions
         self.data_dirs = data_dirs
         self.delimiter = delimiter
         self.col_names = col_names
@@ -880,10 +886,26 @@ class DataMixin:
         label_candidates = ['labels', 'label', 'Labels', 'Label']
         seq_candidates = ['seqs', 'Seqs', 'seq', 'Seq', 'sequence', 'Sequence', 'sequences', 'Sequences']
 
+        revision_by_path = {}
+        if self.data_args.data_revisions is not None:
+            for configured_name, revision in zip(
+                self.data_args.data_names, self.data_args.data_revisions
+            ):
+                resolved_name = resolve_dataset_name(configured_name)
+                path = (
+                    get_dataset_source(resolved_name)
+                    if resolved_name in supported_datasets
+                    else configured_name
+                )
+                revision_by_path[path] = revision
+
         for data_path in self.data_args.data_paths:
             data_name = data_path.split('/')[-1]
             print_message(f'Loading {data_name}')
-            dataset = load_dataset(data_path)
+            dataset = load_dataset(
+                data_path,
+                revision=revision_by_path.get(data_path),
+            )
             if 'inverse' in data_name.lower():
                 dataset = dataset.rename_columns({'seqs': 'labels', 'labels': 'seqs'})
             train_name = self._resolve_split_name(list(dataset.keys()), 'train')
